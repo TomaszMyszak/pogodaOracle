@@ -7,64 +7,82 @@ using Microsoft.Extensions.Logging;
 namespace WeatherService;
 
 /// <summary>
-/// Główna usługa tła (Windows Service / Linux daemon),
-/// uruchamiana przez Host Builder.
-/// 
-/// Worker:
-///  - działa cyklicznie w nieskończonej pętli,
-///  - co określony interwał uruchamia logikę synchronizacji pogody,
-///  - reaguje na sygnał zatrzymania (CancellationToken).
-/// 
-/// W tym projekcie Worker wywołuje klasę <see cref="WeatherSyncJob"/>
-/// odpowiedzialną za pobieranie oraz zapisywanie danych pogodowych.
+/// Usługa tła uruchamiana przez Host Builder (Windows Service / Linux daemon).
+///
+/// <para>
+/// Worker działa jako cykliczny harmonogram testowy – jego pętla nie jest źródłem
+/// danych produkcyjnych, ponieważ właściwy proces synchronizacji sterowany jest
+/// po stronie Oracle (JOB → PL/SQL → UTL_HTTP → serwis .NET).
+/// </para>
+///
+/// <para>
+/// Rola Workera:
+///  - działa w tle i może wykonywać testową synchronizację danych,
+///  - zapewnia mechanizm sanity-check lub diagnostyczny w środowisku DEV/TEST,
+///  - reaguje na sygnały zatrzymania aplikacji (CancellationToken),
+///  - nigdy nie blokuje się na błędach (błędy loguje i kontynuuje pracę).
+/// </para>
 /// </summary>
-public class Worker : BackgroundService
+public sealed class Worker : BackgroundService
 {
     private readonly ILogger<Worker> _logger;
     private readonly WeatherSyncJob _weatherSyncJob;
 
     /// <summary>
-    /// Konstruktor Worker Service.  
-    /// Wstrzykiwany jest logger oraz instancja klasy WeatherSyncJob z DI.
+    /// Konstruktor. Wstrzykuje logger oraz instancję <see cref="WeatherSyncJob"/>.
     /// </summary>
-    /// <param name="logger">Logger używany do zapisywania zdarzeń z pracy usługi.</param>
-    /// <param name="weatherSyncJob">Logika joba synchronizującego pogodę.</param>
-    public Worker(ILogger<Worker> logger, WeatherSyncJob weatherSyncJob)
+    /// <param name="logger">Logger dedykowany dla Workera.</param>
+    /// <param name="weatherSyncJob">Główny komponent zawierający logikę integracji.</param>
+    public Worker(
+        ILogger<Worker> logger,
+        WeatherSyncJob weatherSyncJob)
     {
         _logger = logger;
         _weatherSyncJob = weatherSyncJob;
     }
 
     /// <summary>
-    /// Metoda główna wykonywana po starcie serwisu.
-    /// Pętla działa dopóki aplikacja nie zostanie zatrzymana.
+    /// Główna pętla życiowa Workera.
     /// 
-    /// Schemat:
-    ///     1. Wywołaj _weatherSyncJob.RunOnce()
-    ///     2. Poczekaj 10 minut
-    ///     3. Powtórz
+    /// <para>
+    /// W wersji demonstracyjnej:
+    ///     1. Wywołuje testowy cykl synchronizacji (<see cref="WeatherSyncJob.RunOnce"/>)
+    ///     2. Czeka 10 minut
+    ///     3. Powtarza aż do zatrzymania serwisu
+    /// </para>
+    ///
+    /// <para>
+    /// W środowisku produkcyjnym fakt pobierania danych powinien być sterowany
+    /// wyłącznie z Oracle (PL/SQL → lokalny endpoint HTTP), a Worker może służyć
+    /// jedynie do okresowych samo-testów, monitoringu lub fallbacku.
+    /// </para>
     /// </summary>
     /// <param name="stoppingToken">Token sygnalizujący zatrzymanie usługi.</param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("WeatherService Worker: start at {Time}", DateTime.Now);
+        _logger.LogInformation(
+            "WeatherService Worker: started at {Time}",
+            DateTime.Now);
 
-        // Pętla pracująca do momentu zatrzymania usługi
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                // Wywołanie głównej logiki synchronizacji pogody
+                // Wykonanie jednorazowego cyklu testowego.
+                // Produkcyjnie można to wyłączyć lub zastąpić funkcją diagnostyczną.
                 await _weatherSyncJob.RunOnce(stoppingToken);
             }
             catch (Exception ex)
             {
-                // Złapanie ewentualnych wyjątków, aby Worker nie umierał
-                _logger.LogError(ex, "Błąd podczas wykonywania WeatherSyncJob.");
+                // Worker NIE MOŻE umrzeć — logujemy i pracujemy dalej.
+                _logger.LogError(
+                    ex,
+                    "Błąd podczas wykonywania WeatherSyncJob w Worker Service.");
             }
 
             // Opóźnienie między cyklami (10 minut)
-            _logger.LogInformation("WeatherService czeka 10 minut do kolejnej synchronizacji.");
+            _logger.LogInformation(
+                "WeatherService Worker: oczekiwanie 10 minut do kolejnego cyklu.");
 
             try
             {
@@ -72,11 +90,13 @@ public class Worker : BackgroundService
             }
             catch (TaskCanceledException)
             {
-                // Worker został zatrzymany w trakcie Delay
+                // Prawidłowe zakończenie pracy serwisu
                 break;
             }
         }
 
-        _logger.LogInformation("WeatherService Worker: stop at {Time}", DateTime.Now);
+        _logger.LogInformation(
+            "WeatherService Worker: stopped at {Time}",
+            DateTime.Now);
     }
 }

@@ -22,7 +22,7 @@
     language=C
 }
 
-\title{Dokumentacja techniczna systemu pobierania danych pogodowych \\ \large Oracle + C\# Worker Service}
+\title{Dokumentacja techniczna systemu pobierania danych pogodowych \\ \large Oracle + .NET 8 (Minimal API + Worker Service)}
 \author{CerbIT / System pogodowy}
 \date{\today}
 
@@ -32,65 +32,109 @@
 \section{Wprowadzenie}
 
 Celem projektu jest automatyczne pobieranie danych pogodowych z darmowego API
-(Open-Meteo) i zapisywanie ich do bazy danych Oracle.
-Proces działa jako \textbf{Windows Service} napisany w technologii .NET 8 (Worker Service),
-uruchamiany cyklicznie co 10 minut.
+(Open-Meteo) oraz zapisywanie ich do bazy danych Oracle w sposób bezpieczny i łatwy do monitorowania.
 
-Rozwiązanie składa się z następujących elementów:
+Aktualna architektura składa się z:
 
 \begin{itemize}
-    \item baza danych Oracle – tabele \texttt{WEATHER\_LOCATIONS} oraz \texttt{WEATHER\_MEASUREMENTS},
-    \item serwis Windows (Worker Service) uruchamiany w tle,
-    \item komponent \texttt{WeatherSyncJob} odpowiedzialny za pobieranie i zapis danych,
-    \item konfiguracja w pliku \texttt{appsettings.json}.
+  \item aplikacji .NET 8 uruchamianej jako Windows Service z wbudowanym serwerem HTTP (Kestrel) w trybie \textbf{Minimal API + Worker Service},
+  \item lokalnego endpointu HTTP pełniącego rolę \textbf{proxy pogodowego} dla bazy Oracle,
+  \item procedur PL/SQL i joba DBMS\_SCHEDULER wyzwalających pobranie danych i zapis do tabel,
+  \item bazy danych Oracle (schemat \texttt{TMYSZAK}) z tabelami \texttt{WEATHER\_LOCATIONS} oraz \texttt{WEATHER\_MEASUREMENTS}.
 \end{itemize}
+
+Główny przepływ produkcyjny jest sterowany po stronie Oracle:
+
+\begin{enumerate}
+  \item Job \texttt{JOB\_WEATHER\_SYNC\_ALL} w Oracle uruchamia cyklicznie procedurę PL/SQL.
+  \item Procedura PL/SQL (UTL\_HTTP) wywołuje lokalny endpoint HTTP w serwisie .NET:
+        \texttt{/weather/latest?lat=\dots\&lon=\dots}.
+  \item Serwis .NET pobiera dane z API Open-Meteo, przetwarza JSON do prostego DTO i zwraca mały JSON.
+  \item PL/SQL parsuje JSON (JSON\_TABLE) i zapisuje pomiar do \texttt{TMYSZAK.WEATHER\_MEASUREMENTS}.
+\end{enumerate}
 
 \section{Architektura systemu}
 
 \subsection{Schemat logiczny}
 
 \begin{verbatim}
-+----------------------+      HTTP GET       +-----------------------+
-| Windows Worker       | ------------------> | API Open-Meteo        |
-| Service (.NET 8)     |                    +-----------------------+
-|   - WeatherSyncJob   |
-+----------+-----------+
-           |
-           | ODP.NET
-           v
-+------------------------------+
-| Oracle Database             |
-|   - WEATHER_LOCATIONS       |
-|   - WEATHER_MEASUREMENTS    |
-+------------------------------+
++-------------------------------+
+| Oracle Database (schema TMYSZAK)
+|  - WEATHER_LOCATIONS
+|  - WEATHER_MEASUREMENTS
+|  - P_WEATHER_SYNC_ONE_LOC
+|  - JOB_WEATHER_SYNC_ALL
++-------------------------------+
+               |
+               | UTL_HTTP (GET /weather/latest)
+               v
++-------------------------------+
+| .NET 8 app (Kestrel HTTP)    |
+|  - Minimal API (/health,     |
+|    /weather/latest)          |
+|  - WeatherSyncJob (logika)   |
+|  - Worker (BackgroundService)|
++---------------+---------------+
+                |
+                | HTTPS GET
+                v
++-------------------------------+
+| Zewnętrzne API (Open-Meteo)  |
++-------------------------------+
 \end{verbatim}
 
 \subsection{Opis komponentów}
 
 \begin{itemize}
-  \item \textbf{Worker (BackgroundService)}  
-  Uruchamiany automatycznie przez system Windows. W pętli wykonuje zadania co
-  10 minut.
+  \item \textbf{Minimal API (.NET 8)}
 
-  \item \textbf{WeatherSyncJob}  
-  Główna logika biznesowa:
+  Aplikacja nasłuchuje na porcie HTTP (domyślnie \texttt{http://0.0.0.0:5005}) i udostępnia:
   \begin{itemize}
-    \item test połączeń,
-    \item pobranie danych pogodowych,
-    \item serializacja/parsowanie JSON,
-    \item zapis do Oracle.
+    \item \texttt{GET /health} -- prosty endpoint zdrowia (test połączenia z serwisem),
+    \item \texttt{GET /weather/latest?lat=\{lat\}\&lon=\{lon\}} -- główny endpoint proxy dla Oracle.
   \end{itemize}
 
-  \item \textbf{Oracle}  
-  Baza przechowująca lokalizacje oraz pomiary pogody.
+  \item \textbf{WeatherSyncJob}
+
+  Klasa serwisowa odpowiedzialna za:
+  \begin{itemize}
+    \item test połączeń z Oracle i Open-Meteo (tryb testowy),
+    \item generowanie testowych danych pogodowych i zapis do pliku + bazy (\texttt{RunOnce}),
+    \item pobieranie rzeczywistych danych z Open-Meteo dla zadanych współrzędnych,
+    \item parsowanie JSON z Open-Meteo do wewnętrznego modelu,
+    \item zwracanie uproszczonego DTO \texttt{WeatherDto} do endpointu \texttt{/weather/latest},
+    \item wykonywanie INSERT do \texttt{TMYSZAK.WEATHER\_MEASUREMENTS}.
+  \end{itemize}
+
+  \item \textbf{Worker (BackgroundService)}
+
+  Usługa tła rejestrowana w Host Builderze. W projekcie pełni rolę:
+  \begin{itemize}
+    \item cyklicznego joba testowego (wywołanie \texttt{RunOnce} co 10 minut),
+    \item mechanizmu sanity-check / diagnostycznego,
+    \item komponentu reagującego na sygnały zatrzymania i logującego stan serwisu.
+  \end{itemize}
+  W scenariuszu produkcyjnym głównym sterownikiem pobierania danych jest Oracle
+  (PL/SQL + UTL\_HTTP), a Worker może być dodatkowym mechanizmem testowym.
+
+  \item \textbf{PL/SQL (procedury i job)}
+
+  \begin{itemize}
+    \item \texttt{P\_WEATHER\_SYNC\_ONE\_LOC(p\_id\_location)} -- dla jednej lokalizacji:
+          odczytuje LAT/LON, woła \texttt{/weather/latest}, parsuje JSON, wstawia wiersz do \texttt{WEATHER\_MEASUREMENTS}.
+    \item \texttt{JOB\_WEATHER\_SYNC\_ALL} -- job DBMS\_SCHEDULER, który co 10 minut
+          iteruje po aktywnych lokalizacjach i dla każdej wywołuje \texttt{P\_WEATHER\_SYNC\_ONE\_LOC}.
+    \item \texttt{P\_TEST\_WEATHER\_PROXY} -- procedura testowa wywołująca \texttt{/health}
+          w celu sprawdzenia dostępności serwisu .NET.
+  \end{itemize}
 \end{itemize}
 
 \section{Struktura bazy danych Oracle}
 
-\subsection{Tabela LOCATION}
+\subsection{Tabela WEATHER\_LOCATIONS}
 
 \begin{lstlisting}[language=SQL]
-CREATE TABLE WEATHER_LOCATIONS (
+CREATE TABLE TMYSZAK.WEATHER_LOCATIONS (
     ID_LOCATION      NUMBER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
     COUNTRY_CODE     VARCHAR2(2) NOT NULL,
     CITY_NAME        VARCHAR2(100) NOT NULL,
@@ -100,10 +144,10 @@ CREATE TABLE WEATHER_LOCATIONS (
 );
 \end{lstlisting}
 
-\subsection{Tabela MEASUREMENTS}
+\subsection{Tabela WEATHER\_MEASUREMENTS}
 
 \begin{lstlisting}[language=SQL]
-CREATE TABLE WEATHER_MEASUREMENTS (
+CREATE TABLE TMYSZAK.WEATHER_MEASUREMENTS (
     ID_MEASUREMENT   NUMBER GENERATED AS IDENTITY PRIMARY KEY,
     ID_LOCATION      NUMBER NOT NULL,
     MEASURED_AT      DATE NOT NULL,
@@ -114,101 +158,266 @@ CREATE TABLE WEATHER_MEASUREMENTS (
     RAW_JSON         CLOB,
     INSERTED_AT      DATE DEFAULT SYSDATE NOT NULL,
     CONSTRAINT FK_LOC FOREIGN KEY (ID_LOCATION)
-       REFERENCES WEATHER_LOCATIONS(ID_LOCATION)
+       REFERENCES TMYSZAK.WEATHER_LOCATIONS(ID_LOCATION)
 );
 \end{lstlisting}
 
-\section{Konfiguracja systemu}
+\section{Kontrakt JSON pomiędzy .NET a Oracle}
+
+Endpoint \texttt{GET /weather/latest} zwraca mały JSON (DTO) w formacie:
+
+\begin{lstlisting}[language=json]
+{
+  "measuredAt": "2025-11-20T09:00:00Z",
+  "tempC": 4.5,
+  "humidity": 73.2,
+  "windSpeedMs": 1.8,
+  "isRain": false
+}
+\end{lstlisting}
+
+Pole \texttt{isRain} jest konwertowane w PL/SQL na \texttt{'Y'} / \texttt{'N'} i
+zapisywane w kolumnie \texttt{IS\_RAIN}. Cały JSON lub jego fragment może być
+również przechowywany w kolumnie \texttt{RAW\_JSON}.
+
+\section{Konfiguracja systemu (.NET)}
 
 \subsection{Plik appsettings.json}
 
 \begin{lstlisting}[language=json]
 {
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.Hosting.Lifetime": "Information"
+    }
+  },
   "ConnectionStrings": {
-    "Oracle": "User Id=USER;Password=PASS;Data Source=HOST:1521/SERVICE;"
+    "Oracle": "User Id=TMYSZAK;Password=***;Data Source=HOST:1521/SERVICE;"
   },
   "WeatherApi": {
     "BaseUrl": "https://api.open-meteo.com/v1/forecast",
-    "Params": "hourly=temperature_2m,relativehumidity_2m,
-               precipitation,wind_speed_10m&forecast_days=1&timezone=auto"
+    "Params": "hourly=temperature_2m,relativehumidity_2m,precipitation,windspeed_10m&forecast_days=1&timezone=auto"
   }
 }
 \end{lstlisting}
 
-\section{Implementacja serwisu Windows (.NET 8)}
+\section{Implementacja aplikacji .NET 8 (Minimal API + Worker)}
 
-\subsection{Plik Program.cs}
+\subsection{Program.cs – konfiguracja hosta i endpointów}
 
-\begin{lstlisting}
-var host = Host.CreateDefaultBuilder(args)
-    .UseWindowsService()
-    .ConfigureServices((context, services) =>
+\begin{lstlisting}[language=C]
+var builder = WebApplication.CreateBuilder(args);
+
+// Nasłuch na wszystkich interfejsach, port 5005
+builder.WebHost.UseUrls("http://0.0.0.0:5005");
+
+// Logowanie na konsolę
+builder.Logging.ClearProviders();
+builder.Logging.AddConsole();
+builder.Logging.SetMinimumLevel(LogLevel.Information);
+
+// Rejestracja serwisów
+builder.Services.AddSingleton<WeatherSyncJob>();
+builder.Services.AddHostedService<Worker>();
+
+var app = builder.Build();
+
+// /health
+app.MapGet("/health", () => Results.Ok("OK"));
+
+// /weather/latest?lat=..&lon=..
+app.MapGet("/weather/latest",
+    async (double lat,
+           double lon,
+           WeatherSyncJob job,
+           CancellationToken token) =>
+{
+    // walidacja parametrów
+    if (lat is < -90 or > 90)
+        return Results.BadRequest("Nieprawidłowa szerokość geograficzna.");
+    if (lon is < -180 or > 180)
+        return Results.BadRequest("Nieprawidłowa długość geograficzna.");
+
+    var dto = await job.GetLatestMeasurementDtoAsync(lat, lon, token);
+    if (dto is null)
     {
-        services.AddSingleton<WeatherSyncJob>();
-        services.AddHostedService<Worker>();
-    })
-    .Build();
+        return Results.Problem(
+            detail: "Brak danych z serwisu pogodowego.",
+            statusCode: StatusCodes.Status502BadGateway,
+            title: "Błąd proxy pogodowego");
+    }
 
-await host.RunAsync();
+    return Results.Ok(dto);
+});
+
+app.Run();
 \end{lstlisting}
 
-\subsection{Worker.cs – serwis cykliczny}
+\subsection{Worker.cs – cykliczny job testowy}
 
-\begin{lstlisting}
-public class Worker : BackgroundService
+\begin{lstlisting}[language=C]
+public sealed class Worker : BackgroundService
 {
-    private readonly WeatherSyncJob _job;
+    private readonly ILogger<Worker> _logger;
+    private readonly WeatherSyncJob _weatherSyncJob;
 
-    public Worker(WeatherSyncJob job) => _job = job;
-
-    protected override async Task ExecuteAsync(CancellationToken token)
+    public Worker(ILogger<Worker> logger, WeatherSyncJob weatherSyncJob)
     {
-        while (!token.IsCancellationRequested)
+        _logger = logger;
+        _weatherSyncJob = weatherSyncJob;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        _logger.LogInformation("WeatherService Worker: started at {Time}", DateTime.Now);
+
+        while (!stoppingToken.IsCancellationRequested)
         {
-            await _job.RunOnce(token);
-            await Task.Delay(TimeSpan.FromMinutes(10), token);
+            try
+            {
+                await _weatherSyncJob.RunOnce(stoppingToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Błąd podczas wykonywania WeatherSyncJob.");
+            }
+
+            _logger.LogInformation(
+                "WeatherService Worker: oczekiwanie 10 minut do kolejnego cyklu.");
+
+            try
+            {
+                await Task.Delay(TimeSpan.FromMinutes(10), stoppingToken);
+            }
+            catch (TaskCanceledException)
+            {
+                break;
+            }
         }
+
+        _logger.LogInformation("WeatherService Worker: stopped at {Time}", DateTime.Now);
     }
 }
 \end{lstlisting}
 
 \section{Logika synchronizacji – WeatherSyncJob}
 
-\subsection{Test połączeń}
+\subsection{Pobieranie i parsowanie danych z Open-Meteo}
 
-\begin{lstlisting}
-private async Task TestConnectionsAsync(CancellationToken token)
+\begin{lstlisting}[language=C]
+public async Task<WeatherDto?> GetLatestMeasurementDtoAsync(
+    double latitude,
+    double longitude,
+    CancellationToken cancellationToken)
 {
-    using var conn = new OracleConnection(_conn);
-    await conn.OpenAsync(token);
-    
-    var resp = await new HttpClient().GetAsync(_url, token);
+    string? baseUrl = _configuration["WeatherApi:BaseUrl"];
+    string? commonParms = _configuration["WeatherApi:Params"];
+
+    if (string.IsNullOrWhiteSpace(baseUrl))
+    {
+        _logger.LogError("Brak konfiguracji WeatherApi:BaseUrl");
+        return null;
+    }
+
+    var sb = new StringBuilder();
+    sb.Append(baseUrl);
+    sb.Append("?latitude=");
+    sb.Append(latitude.ToString(CultureInfo.InvariantCulture));
+    sb.Append("&longitude=");
+    sb.Append(longitude.ToString(CultureInfo.InvariantCulture));
+
+    if (!string.IsNullOrWhiteSpace(commonParms))
+    {
+        sb.Append('&');
+        sb.Append(commonParms);
+    }
+
+    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+
+    HttpResponseMessage resp;
+    try
+    {
+        resp = await http.GetAsync(sb.ToString(), cancellationToken);
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Błąd przy wywołaniu serwisu pogodowego.");
+        return null;
+    }
+
+    if (!resp.IsSuccessStatusCode)
+    {
+        _logger.LogError(
+            "Weather API zwrócił status {Code} {Reason}",
+            (int)resp.StatusCode,
+            resp.ReasonPhrase);
+        return null;
+    }
+
+    var rawJson = await resp.Content.ReadAsStringAsync(cancellationToken);
+    var measurement = ParseLatestMeasurement(rawJson);
+    if (measurement is null)
+    {
+        _logger.LogWarning("Nie udało się sparsować JSON z Open-Meteo.");
+        return null;
+    }
+
+    return new WeatherDto(
+        MeasuredAt: measurement.MeasuredAt,
+        TempC: measurement.TempC,
+        Humidity: measurement.Humidity,
+        WindSpeedMs: measurement.WindSpeedMs,
+        IsRain: measurement.IsRain);
 }
 \end{lstlisting}
 
-\subsection{Parsowanie JSON}
+\subsection{Insert do TMYSZAK.WEATHER\_MEASUREMENTS}
 
-\begin{lstlisting}
-var doc = JsonDocument.Parse(json);
-var hourly = doc.RootElement.GetProperty("hourly");
-var last = hourly.GetProperty("time").GetArrayLength() - 1;
-
-var measurement = new WeatherMeasurement {
-    TempC = hourly.GetProperty("temperature_2m")[last].GetDouble(),
-    ...
-};
+\begin{lstlisting}[language=SQL]
+INSERT INTO TMYSZAK.WEATHER_MEASUREMENTS
+    (ID_LOCATION, MEASURED_AT, TEMP_C, IS_RAIN,
+     HUMIDITY, WIND_SPEED_MS, RAW_JSON)
+VALUES
+    (:p_loc, :p_time, :p_temp, :p_rain,
+     :p_hum, :p_wind, :p_json);
 \end{lstlisting}
 
-\subsection{Zapis pomiaru do Oracle}
+\section{Procedury PL/SQL i scheduler}
 
-\begin{lstlisting}
-INSERT INTO WEATHER_MEASUREMENTS
-(ID_LOCATION, MEASURED_AT, TEMP_C, IS_RAIN,
- HUMIDITY, WIND_SPEED_MS, RAW_JSON)
-VALUES (:loc, :time, :temp, :rain, :hum, :wind, :json)
-\end{lstlisting}
+\subsection{P\_WEATHER\_SYNC\_ONE\_LOC}
 
-\section{Instalacja jako usługa Windows}
+Procedura:
+
+\begin{itemize}
+  \item odczytuje \texttt{LATITUDE}, \texttt{LONGITUDE} z \texttt{TMYSZAK.WEATHER\_LOCATIONS},
+  \item woła \texttt{http://127.0.0.1:5005/weather/latest?lat=\dots\&lon=\dots} za pomocą UTL\_HTTP,
+  \item odbiera JSON do CLOB,
+  \item parsuje JSON\_TABLE do zmiennych PL/SQL,
+  \item mapuje \texttt{isRain} $\rightarrow$ \texttt{'Y'}/\texttt{'N'},
+  \item wykonuje INSERT do \texttt{TMYSZAK.WEATHER\_MEASUREMENTS},
+  \item na końcu wykonuje \texttt{COMMIT}.
+\end{itemize}
+
+\subsection{JOB\_WEATHER\_SYNC\_ALL}
+
+Job DBMS\_SCHEDULER:
+
+\begin{itemize}
+  \item uruchamiany co 10 minut,
+  \item iteruje po \texttt{WEATHER\_LOCATIONS} z \texttt{ACTIVE\_FLAG = 'Y'},
+  \item dla każdej lokalizacji wywołuje \texttt{P\_WEATHER\_SYNC\_ONE\_LOC(id\_location)}.
+\end{itemize}
+
+\subsection{P\_TEST\_WEATHER\_PROXY i ACL}
+
+\begin{itemize}
+  \item \texttt{P\_TEST\_WEATHER\_PROXY} wywołuje \texttt{/health} i wypisuje odpowiedź w \texttt{DBMS\_OUTPUT}.
+  \item ACL z użyciem \texttt{DBMS\_NETWORK\_ACL\_ADMIN.append\_host\_ace} pozwala
+        schematowi \texttt{TMYSZAK} na HTTP do hosta \texttt{127.0.0.1}.
+\end{itemize}
+
+\section{Instalacja aplikacji .NET jako usługa Windows}
 
 \subsection{Publikacja projektu}
 
@@ -223,18 +432,35 @@ sc create WeatherService binPath= "C:\Weather\WeatherService.exe"
 sc start WeatherService
 \end{lstlisting}
 
+Aplikacja po uruchomieniu wystawia port HTTP (np. 5005) dla wywołań z Oracle.
+
 \section{Podsumowanie}
 
 Przygotowany system umożliwia:
 
 \begin{itemize}
-  \item automatyczne i cykliczne pobieranie danych pogodowych,
-  \item stabilne działanie jako usługa Windows,
-  \item pełną integrację z Oracle (ODP.NET),
-  \item możliwość łatwego rozszerzania o kolejne lokalizacje i parametry.
+  \item automatyczne i cykliczne pobieranie danych pogodowych poprzez DBMS\_SCHEDULER w Oracle,
+  \item wykorzystanie lekkiego serwisu .NET jako proxy HTTP do zewnętrznego API pogodowego,
+  \item stabilne działanie jako usługa Windows z logowaniem i Worker Service,
+  \item pełną integrację z Oracle (ODP.NET, UTL\_HTTP, JSON\_TABLE),
+  \item łatwe dodawanie nowych lokalizacji (tabela \texttt{WEATHER\_LOCATIONS})
+        i rozszerzeń logiki po obu stronach (C\# / PL/SQL).
 \end{itemize}
 
-System jest gotowy do użycia produkcyjnego po dodaniu logowania (np. Serilog)
-i mechanizmów retry/fallback przy błędach API.
+System jest gotowy do użycia produkcyjnego po uzupełnieniu:
+
+\begin{itemize}
+  \item spójnego logowania (np. Serilog, logi do plików / tabel),
+  \item polityki retry/fallback przy błędach API i sieci,
+  \item monitoringu endpointów (\texttt{/health}, \texttt{/weather/latest}) oraz jobów DBMS\_SCHEDULER.
+\end{itemize}
 
 \end{document}
+
+
+
+
+
+Code
+
+GPT-5.1 (l
